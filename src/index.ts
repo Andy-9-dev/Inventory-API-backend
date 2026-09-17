@@ -6,12 +6,17 @@ import orderRoutes from "./routes/orders";
 import statsRoutes from "./routes/stats";
 
 const app = express();
-const PORT = 4001;
+const PORT = process.env.PORT || 4001;
 
 // ─── Middleware ───────────────────────────────────────────────────────────────
+const allowedOrigins = [
+  "http://localhost:5173", // local dev
+  process.env.FRONTEND_URL, // deployed frontend (set this on Render)
+].filter((origin): origin is string => Boolean(origin));
+
 app.use(
   cors({
-    origin: "http://localhost:5173", // Vite / frontend dev server
+    origin: allowedOrigins,
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE"],
     allowedHeaders: ["Content-Type"],
   })
