@@ -1,0 +1,118 @@
+import { Router, Request, Response } from "express";
+import { v4 as uuidv4 } from "uuid";
+import { getDb } from "../db";
+import { Product, CreateProductBody } from "../types";
+
+const router = Router();
+
+// ─── GET /api/products ────────────────────────────────────────────────────────
+// Returns all products
+router.get("/", async (_req: Request, res: Response): Promise<void> => {
+  try {
+    const db = await getDb();
+    const products = await db.all<Product[]>("SELECT * FROM products");
+    res.json(products);
+  } catch (err) {
+    console.error("GET /api/products error:", err);
+    res.status(500).json({ error: "Failed to retrieve products." });
+  }
+});
+
+// ─── GET /api/products/:id ────────────────────────────────────────────────────
+// Returns a single product by id, or 404 if not found
+router.get("/:id", async (req: Request, res: Response): Promise<void> => {
+  try {
+    const db = await getDb();
+    const product = await db.get<Product>(
+      "SELECT * FROM products WHERE id = ?",
+      req.params.id
+    );
+
+    if (!product) {
+      res.status(404).json({ error: "Product not found." });
+      return;
+    }
+
+    res.json(product);
+  } catch (err) {
+    console.error("GET /api/products/:id error:", err);
+    res.status(500).json({ error: "Failed to retrieve product." });
+  }
+});
+
+// ─── POST /api/products ───────────────────────────────────────────────────────
+// Creates a new product; returns it with 201
+router.post("/", async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { name, category, price, stock } = req.body as CreateProductBody;
+
+    // ── Validation ──────────────────────────────────────────────────────────
+    if (
+      name === undefined ||
+      category === undefined ||
+      price === undefined ||
+      stock === undefined
+    ) {
+      res
+        .status(400)
+        .json({ error: "name, category, price, and stock are all required." });
+      return;
+    }
+
+    if (typeof name !== "string" || name.trim() === "") {
+      res.status(400).json({ error: "name must be a non-empty string." });
+      return;
+    }
+
+    if (typeof category !== "string" || category.trim() === "") {
+      res.status(400).json({ error: "category must be a non-empty string." });
+      return;
+    }
+
+    if (typeof price !== "number" || isNaN(price) || price < 0) {
+      res
+        .status(400)
+        .json({ error: "price must be a non-negative number." });
+      return;
+    }
+
+    if (
+      typeof stock !== "number" ||
+      isNaN(stock) ||
+      stock < 0 ||
+      !Number.isInteger(stock)
+    ) {
+      res
+        .status(400)
+        .json({ error: "stock must be a non-negative integer." });
+      return;
+    }
+    // ────────────────────────────────────────────────────────────────────────
+
+    const id = uuidv4();
+    const trimmedName = name.trim();
+    const trimmedCategory = category.trim();
+
+    const db = await getDb();
+    await db.run(
+      "INSERT INTO products (id, name, category, price, stock) VALUES (?, ?, ?, ?, ?)",
+      id,
+      trimmedName,
+      trimmedCategory,
+      price,
+      stock
+    );
+
+    const created = await db.get<Product>(
+      "SELECT * FROM products WHERE id = ?",
+      id
+    );
+
+    res.status(201).json(created);
+  } catch (err) {
+    console.error("POST /api/products error:", err);
+    res.status(500).json({ error: "Failed to create product." });
+  }
+});
+
+export default router;
