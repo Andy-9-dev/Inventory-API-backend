@@ -1,4 +1,5 @@
 // Shared TypeScript interfaces for the Inventory API
+import { Request } from "express";
 
 export interface Product {
   id: string;
@@ -40,4 +41,52 @@ export interface StatsResponse {
 export interface CreateOrderBody {
   product_id: string;
   quantity: number;
+}
+
+// ─── Auth ─────────────────────────────────────────────────────────────────────
+
+export type UserRole = "admin" | "user";
+
+/** Row shape as stored in the users table (password_hash never leaves the DB layer) */
+export interface User {
+  id: string;
+  email: string;
+  password_hash: string;
+  role: UserRole;
+  created_at: string;
+}
+
+/** Safe public representation — never includes password_hash */
+export interface PublicUser {
+  id: string;
+  email: string;
+  role: UserRole;
+}
+
+/** POST /api/auth/register request body */
+export interface RegisterRequest {
+  email: string;
+  password: string;
+  role: UserRole;
+}
+
+/** POST /api/auth/login request body */
+export interface LoginRequest {
+  email: string;
+  password: string;
+}
+
+/** Payload encoded inside the JWT */
+export interface JwtPayload {
+  userId: string;
+  email: string;
+  role: UserRole;
+}
+
+/**
+ * Express Request extended with the authenticated user info.
+ * Set by requireAuth middleware after a valid JWT is verified.
+ */
+export interface AuthenticatedRequest extends Request {
+  user: JwtPayload;
 }

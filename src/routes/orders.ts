@@ -1,28 +1,29 @@
 import { Router, Request, Response } from "express";
 import { v4 as uuidv4 } from "uuid";
-import { getDb } from "../db";
+import { getPool } from "../db";
 import { Product, Order, OrderWithProduct, CreateOrderBody } from "../types";
 
 const router = Router();
 
 // ─── GET /api/orders ──────────────────────────────────────────────────────────
-// Returns all orders with the related product name, newest first
+// Returns all orders with the related product name, newest first.
+// created_at is cast to TEXT so the response matches the Order interface (string).
 router.get("/", async (_req: Request, res: Response): Promise<void> => {
   try {
-    const db = await getDb();
-    const orders = await db.all<OrderWithProduct[]>(`
+    const pool = await getPool();
+    const result = await pool.query<OrderWithProduct>(`
       SELECT
         o.id,
         o.product_id,
         o.quantity,
         o.status,
-        o.created_at,
-        p.name AS product_name
-      FROM orders o
-      JOIN products p ON o.product_id = p.id
-      ORDER BY o.created_at DESC
+        o.created_at::text AS created_at,
+        p.name             AS product_name
+      FROM   orders   o
+      JOIN   products p ON o.product_id = p.id
+      ORDER  BY o.created_at DESC
     `);
-    res.json(orders);
+    res.json(result.rows);
   } catch (err) {
     console.error("GET /api/orders error:", err);
     res.status(500).json({ error: "Failed to retrieve orders." });
@@ -30,15 +31,21 @@ router.get("/", async (_req: Request, res: Response): Promise<void> => {
 });
 
 // ─── POST /api/orders ─────────────────────────────────────────────────────────
-// Core business logic:
+// Business logic (unchanged from SQLite version):
 //   1. Validate input
 //   2. Look up product — 404 if missing
-//   3. Compare requested quantity against current stock
-//      • Not enough stock  → save order as "rejected", return 200 + message
-//      • Enough stock      → deduct stock, save order as "confirmed", return 201
+//   3a. quantity > stock  → INSERT rejected order, return 200 + message (no stock deduction)
+//   3b. quantity ≤ stock  → UPDATE stock + INSERT confirmed order, return 201
 //
-// IMPORTANT: stock is ONLY deducted when the order is confirmed.
+// Postgres-specific addition: steps 3b UPDATE + INSERT are wrapped in an
+// explicit transaction with SELECT ... FOR UPDATE to prevent a race condition
+// where two concurrent requests both pass the stock check before either
+// deducts.  On SQLite this was safe because all writes serialise on the file
+// lock; on Postgres with a connection pool it is not.
 router.post("/", async (req: Request, res: Response): Promise<void> => {
+  const pool = await getPool();
+  const client = await pool.connect();
+
   try {
     const { product_id, quantity } = req.body as CreateOrderBody;
 
@@ -51,9 +58,7 @@ router.post("/", async (req: Request, res: Response): Promise<void> => {
     }
 
     if (typeof product_id !== "string" || product_id.trim() === "") {
-      res
-        .status(400)
-        .json({ error: "product_id must be a non-empty string." });
+      res.status(400).json({ error: "product_id must be a non-empty string." });
       return;
     }
 
@@ -70,69 +75,68 @@ router.post("/", async (req: Request, res: Response): Promise<void> => {
     }
     // ────────────────────────────────────────────────────────────────────────
 
-    const db = await getDb();
+    await client.query("BEGIN");
 
-    // ── Step 1: look up the product ──────────────────────────────────────────
-    const product = await db.get<Product>(
-      "SELECT * FROM products WHERE id = ?",
-      product_id.trim()
+    // Lock the product row for the duration of this transaction so concurrent
+    // orders can't both pass the stock check before either deducts stock.
+    const productResult = await client.query<Product>(
+      "SELECT * FROM products WHERE id = $1 FOR UPDATE",
+      [product_id.trim()]
     );
 
-    if (!product) {
+    if (productResult.rows.length === 0) {
+      await client.query("ROLLBACK");
       res.status(404).json({ error: "Product not found." });
       return;
     }
 
+    const product = productResult.rows[0];
     const orderId = uuidv4();
 
-    // ── Step 2: stock check ──────────────────────────────────────────────────
+    // ── Stock check ──────────────────────────────────────────────────────────
     if (quantity > product.stock) {
-      // Not enough stock — record a rejected order but do NOT touch stock
-      await db.run(
+      // Not enough stock — record a rejected order, do NOT touch stock
+      const insertResult = await client.query<Order>(
         `INSERT INTO orders (id, product_id, quantity, status)
-         VALUES (?, ?, ?, 'rejected')`,
-        orderId,
-        product.id,
-        quantity
+         VALUES ($1, $2, $3, 'rejected')
+         RETURNING id, product_id, quantity, status, created_at::text AS created_at`,
+        [orderId, product.id, quantity]
       );
 
-      const rejectedOrder = await db.get<Order>(
-        "SELECT * FROM orders WHERE id = ?",
-        orderId
-      );
+      await client.query("COMMIT");
 
       res.status(200).json({
         message: `Order rejected: requested ${quantity} unit(s) but only ${product.stock} in stock. No stock was deducted.`,
-        order: rejectedOrder,
+        order: insertResult.rows[0],
       });
       return;
     }
 
-    // ── Step 3: enough stock — deduct and confirm ────────────────────────────
-    // Deduct stock first; if this fails the INSERT below never runs
-    await db.run(
-      "UPDATE products SET stock = stock - ? WHERE id = ?",
-      quantity,
-      product.id
+    // ── Enough stock — deduct and confirm ────────────────────────────────────
+    await client.query(
+      "UPDATE products SET stock = stock - $1 WHERE id = $2",
+      [quantity, product.id]
     );
 
-    await db.run(
+    const insertResult = await client.query<Order>(
       `INSERT INTO orders (id, product_id, quantity, status)
-       VALUES (?, ?, ?, 'confirmed')`,
-      orderId,
-      product.id,
-      quantity
+       VALUES ($1, $2, $3, 'confirmed')
+       RETURNING id, product_id, quantity, status, created_at::text AS created_at`,
+      [orderId, product.id, quantity]
     );
 
-    const confirmedOrder = await db.get<Order>(
-      "SELECT * FROM orders WHERE id = ?",
-      orderId
-    );
+    await client.query("COMMIT");
 
-    res.status(201).json(confirmedOrder);
+    res.status(201).json(insertResult.rows[0]);
   } catch (err) {
+    await client.query("ROLLBACK").catch(() => {
+      // swallow rollback errors — original error is what matters
+    });
     console.error("POST /api/orders error:", err);
     res.status(500).json({ error: "Failed to create order." });
+  } finally {
+    // Always release the client back to the pool, even on error
+    client.release();
   }
 });
 
